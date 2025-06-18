@@ -199,19 +199,21 @@ class Parser(object):
 
         for operator, operandr in zip(operators, operands[1:]):
             if isinstance(operator, tuple) and operator[0] == 'instanceof_pattern':
-                _, type_node, var_name_str = operator
-                # 'operation' is the operandl (left-hand side of instanceof)
-                # 'operandr' (the type_node) is already captured in our tuple,
-                # but build_binary_operation structure provides it. We use the one from tuple.
-                pattern_var = tree.FormalParameter(type=type_node,
-                                                   name=var_name_str,
-                                                   modifiers=set(), # Pattern variables in instanceof don't have modifiers
-                                                   annotations=[]) # or annotations
+                # operator is ('instanceof_pattern', pattern_node)
+                # pattern_node can be FormalParameter (for Type Pattern) or RecordPattern
+                _, pattern_node = operator
+
+                # Determine the primary type being checked against
+                # For FormalParameter, it's pattern_node.type
+                # For RecordPattern, it's pattern_node.type
+                instanceof_check_type = pattern_node.type
+
                 operation = tree.InstanceOfPatternExpression(expression=operation,
-                                                             type=type_node,
-                                                             pattern_variable=pattern_var)
-            elif operator == 'instanceof': # Legacy instanceof
-                operation = tree.BinaryOperation(operandl=operation, operator='instanceof', operandr=operandr)
+                                                             type=instanceof_check_type,
+                                                             pattern=pattern_node)
+            elif isinstance(operator, tuple) and operator[0] == 'instanceof_type': # Legacy instanceof
+                _, type_node = operator
+                operation = tree.BinaryOperation(operandl=operation, operator='instanceof', operandr=type_node)
             else: # Other binary operations
                 op_obj = tree.BinaryOperation(operandl=operation)
                 op_obj.operator = operator
@@ -280,9 +282,9 @@ class Parser(object):
     def parse_compilation_unit(self):
         package = None
         package_annotations = None
-        javadoc = None
+        javadoc = None # Javadoc for package or first declaration
         import_declarations = list()
-        type_declarations = list()
+        declarations_list = list() # Changed from type_declarations
 
         self.tokens.push_marker()
         next_token = self.tokens.look()
@@ -319,12 +321,119 @@ class Parser(object):
             except StopIteration:
                 self.illegal("Unexpected end of input")
 
-            if type_declaration:
-                type_declarations.append(type_declaration)
+            if self.try_accept(';'): # Skip stray semicolons
+                self.tokens.pop_marker(False) # Consume the marker
+                self.tokens.push_marker() # Push a new one for the next iteration
+                continue
+
+            # For each declaration (type or method)
+            current_javadoc = self.tokens.look().javadoc # Javadoc for this specific declaration
+            self.tokens.push_marker() # Marker for current declaration attempt
+
+            declaration_node = None
+            try:
+                modifiers, annotations, _ = self.parse_modifiers() # Javadoc handled by current_javadoc
+
+                # Dispatch: Try Type Declaration first, then Method Declaration
+                token_after_modifiers = self.tokens.look()
+
+                if token_after_modifiers.value in ('class', 'interface', 'enum', 'record') or \
+                   (isinstance(token_after_modifiers, Annotation) and self.tokens.look(1).value == 'interface'):
+                    # It's a type declaration. parse_class_or_interface_declaration will re-parse modifiers.
+                    # So, we need to backtrack the modifiers we just parsed.
+                    self.tokens.pop_marker(True) # Backtrack modifiers by restoring state before parse_modifiers
+                    self.tokens.push_marker() # Push marker for parse_type_declaration
+                    declaration_node = self.parse_type_declaration() # This parses its own modifiers
+                    if declaration_node is None and self.try_accept(';'): # handle case of just a semicolon
+                        self.tokens.pop_marker(False)
+                        self.tokens.push_marker()
+                        continue
+                else:
+                    # Attempt to parse as a top-level method
+                    # parse_modifiers already consumed relevant parts, pass them directly
+                    declaration_node = self.parse_top_level_method_declaration(modifiers, annotations, current_javadoc)
+
+                if declaration_node:
+                    declarations_list.append(declaration_node)
+                    self.tokens.pop_marker(False) # Successfully parsed something, commit
+                else:
+                    # This case should ideally not be reached if parsing is correct and errors are raised
+                    self.tokens.pop_marker(True) # Backtrack if nothing was parsed
+                    if not isinstance(self.tokens.look(), EndOfInput): # Avoid error on trailing comments/whitespace
+                        self.illegal("Expected type or method declaration")
+
+            except JavaSyntaxError as e:
+                self.tokens.pop_marker(True) # Backtrack on error
+                # If after backtracking, it's an EndOfInput, it might just be trailing comments or whitespace.
+                if isinstance(self.tokens.look(), EndOfInput):
+                    break
+                # Re-raise if it's not just trailing content or a successfully skipped semicolon
+                if not self.try_accept(';'):
+                    raise e
+                # If it was a semicolon, loop continues.
+
+            self.tokens.push_marker() # Push marker for the next iteration's initial javadoc/modifier lookahead
+
+        self.tokens.pop_marker(False) # Pop the final marker
 
         return tree.CompilationUnit(package=package,
                                     imports=import_declarations,
-                                    types=type_declarations)
+                                    declarations=declarations_list)
+
+    @parse_debug
+    def parse_top_level_method_declaration(self, modifiers, annotations, javadoc):
+        # Similar to parse_member_declaration but simplified for top-level methods
+        # No constructors, no class-specific members.
+
+        token = self.tokens.look()
+        method_declaration = None
+
+        if self.try_accept('void'):
+            method_name = self.parse_identifier()
+            # parse_void_method_declarator_rest expects to be part of a MethodDeclaration node
+            # It returns a MethodDeclaration node, but we need to set name, modifiers etc.
+            method_declaration = self.parse_void_method_declarator_rest()
+            method_declaration.name = method_name
+        elif token.value == '<': # Generic method
+            # parse_generic_method_or_constructor_declaration handles constructors too, be careful
+            # We need a variant or ensure it only produces MethodDeclaration here.
+            # Let's adapt parts of it.
+            type_parameters = self.parse_type_parameters()
+
+            return_type_node = None
+            if not self.try_accept('void'):
+                return_type_node = self.parse_type()
+
+            method_name = self.parse_identifier()
+            # parse_method_declarator_rest creates the core MethodDeclaration
+            method_declaration = self.parse_method_declarator_rest()
+            method_declaration.name = method_name
+            method_declaration.return_type = return_type_node # Might be None if void was parsed by declarator_rest
+            method_declaration.type_parameters = type_parameters
+
+        elif isinstance(token, (Identifier, BasicType)): # Non-void, non-generic method
+            return_type_node = self.parse_type()
+            method_name = self.parse_identifier()
+            method_declaration = self.parse_method_declarator_rest() # Fills params, body, throws
+
+            # parse_method_declarator_rest sets a dummy return_type for dimensions.
+            # We need to preserve these dimensions if the actual return_type_node also has them.
+            if method_declaration.return_type and method_declaration.return_type.dimensions:
+                return_type_node.dimensions = (return_type_node.dimensions or []) + method_declaration.return_type.dimensions
+
+            method_declaration.name = method_name
+            method_declaration.return_type = return_type_node
+        else:
+            # If it doesn't look like a method after modifiers, it's an error (or should have been dispatched to type decl)
+            self.illegal("Expected method declaration")
+
+        if method_declaration:
+            method_declaration._position = token.position
+            method_declaration.modifiers = modifiers
+            method_declaration.annotations = annotations
+            method_declaration.documentation = javadoc
+
+        return method_declaration
 
     @parse_debug
     def parse_import_declaration(self):
@@ -1685,9 +1794,138 @@ class Parser(object):
         return tree.SwitchExpression(selector=selector, cases=cases)
 
     @parse_debug
+    def parse_record_pattern_components(self, record_type_node):
+        """ Parses components of a record pattern, e.g., (Type1 p1, var p2, RecordPattern(Type3 n1) n2) """
+        self.accept('(')
+        components = []
+        if self.try_accept(')'):
+            return components
+
+        while True:
+            # Each component is a pattern.
+            # For now, we simplify: Type ident, var ident.
+            # A full implementation would recursively call a general parse_pattern() here.
+            component_pattern = None
+            component_token_pos = self.tokens.look()
+
+            if self.tokens.look().value == 'var':
+                self.accept('var')
+                var_type_node = tree.ReferenceType(name='var', _position=component_token_pos.position)
+                var_name = self.parse_identifier()
+                # Array dimensions for var pattern components can be part of type or name (e.g. var String[] s, var int s[])
+                # For simplicity, assume dimensions are parsed with type if explicit, or handled by var semantics.
+                # Here, var_type_node has no explicit dimensions. If var x[], that's different.
+                # Let's assume `var name` means name is the pattern.
+                component_pattern = tree.FormalParameter(type=var_type_node,
+                                                         name=var_name,
+                                                         modifiers=set(),
+                                                         annotations=[],
+                                                         _position=component_token_pos.position)
+            else:
+                # Try to parse as Type identifier or nested RecordPattern
+                # This is a simplified version of what parse_case_label or a full parse_pattern would do.
+                # For now, let's assume it's Type identifier for non-nested record patterns.
+                # A more complete solution would call a generalized parse_pattern here.
+                parsed_type = self.parse_type() # This is the component's type
+
+                # Check for nested record pattern: Type(...)
+                if self.would_accept('('): # This indicates a nested record pattern
+                    # The parsed_type is the type of the nested record.
+                    # We need its name for the outer component, then parse its sub-components.
+                    # This part requires careful handling of component names for nested patterns.
+                    # E.g., Point(Point(int x, int y) origin, int w)
+                    # Here, 'origin' is the name of the component of type Point.
+                    # The current structure of parse_type might consume the name if it's a simple type.
+                    # This is a simplification: we assume the component name is parsed after the nested pattern.
+
+                    # For now, we won't support named nested record components directly here,
+                    # as it complicates things significantly without a full parse_pattern.
+                    # We'll assume for now that if Type(...) is found, it's an unnamed nested pattern,
+                    # or more likely, we restrict components to be Type identifier for now.
+
+                    # Simplification: disallow nested record patterns in this first pass.
+                    # Instead, expect Type identifier.
+                    # self.illegal("Nested record patterns not yet supported in this simplified parser.")
+
+                    # Assuming Type identifier for now:
+                    component_name = self.parse_identifier()
+                    component_pattern = tree.FormalParameter(type=parsed_type,
+                                                             name=component_name,
+                                                             modifiers=set(),
+                                                             annotations=[],
+                                                             _position=component_token_pos.position)
+
+                elif isinstance(self.tokens.look(), Identifier): # Type identifier
+                    component_name = self.parse_identifier()
+                    component_pattern = tree.FormalParameter(type=parsed_type,
+                                                             name=component_name,
+                                                             modifiers=set(),
+                                                             annotations=[],
+                                                             _position=component_token_pos.position)
+                else:
+                    self.illegal("Expected identifier or nested pattern in record component")
+
+            components.append(component_pattern)
+
+            if not self.try_accept(','):
+                break
+        self.accept(')')
+        return components
+
+    @parse_debug
     def parse_case_label(self):
         """
         Parses a case label, which can be:
+        - 'null'
+        - A record pattern: Type(...)
+        - A type pattern: Type identifier
+        - An expression (constant)
+        Returns an AST node representing the label.
+        """
+        token_pos_ref = self.tokens.look()
+
+        if self.would_accept('null'):
+            # Handle 'null' label
+            if not isinstance(self.tokens.look(1), Identifier):
+                self.accept('null')
+                return tree.Literal(value='null', _position=token_pos_ref.position)
+
+        # Try parsing as a Type, then check for record pattern or type pattern
+        self.tokens.push_marker()
+        try:
+            potential_record_type = self.parse_type()
+
+            # Check for Record Pattern: Type(...)
+            if self.would_accept('('):
+                # Pass the parsed type as the record's type
+                components = self.parse_record_pattern_components(potential_record_type)
+                self.tokens.pop_marker(accept=True) # Commit
+                return tree.RecordPattern(type=potential_record_type,
+                                          components=components,
+                                          _position=token_pos_ref.position)
+
+            # Check for Type Pattern: Type identifier
+            if isinstance(self.tokens.look(0), Identifier) and \
+               not self.tokens.look(1).value in ['.', '(', '[']:
+                pattern_variable_name = self.parse_identifier()
+                self.tokens.pop_marker(accept=True) # Commit
+                return tree.FormalParameter(type=potential_record_type,
+                                             name=pattern_variable_name,
+                                             modifiers=set(),
+                                             annotations=[],
+                                             varargs=False,
+                                             _position=token_pos_ref.position)
+
+            # If not a record or type pattern starting with this Type, rollback
+            self.tokens.pop_marker(accept=False)
+        except JavaSyntaxError:
+            self.tokens.pop_marker(accept=False) # Rollback on any parsing error for Type or Identifier
+
+        # Fallback: Parse as an expression (constant or qualified enum)
+        return self.parse_expression()
+
+    @parse_debug
+    def parse_switch_rule(self): # For Switch Expressions
         - 'null'
         - A type pattern (Type identifier)
         - An expression (constant)
@@ -2081,62 +2319,38 @@ class Parser(object):
         token = self.tokens.look()
         while token.value in Operator.INFIX or token.value == 'instanceof':
             if self.try_accept('instanceof'):
-                comparison_type = self.parse_type()
-                # Check for pattern variable
-                pattern_variable_name_str = None
-                # Lookahead: next token is an Identifier, and not followed by '(', '.', etc.
-                # that would make it something else. For simplicity, just check if it's an Identifier.
-                # A more robust check might be needed for edge cases, e.g. if an identifier
-                # could be a type name in some context here.
-                if isinstance(self.tokens.look(), Identifier):
-                    # Check that this identifier isn't part of a qualified name or method call
-                    # This is a simplified check. A full check would involve more lookahead.
-                    # e.g. 'obj instanceof Type v.method()' should not parse 'v' as pattern.
-                    # However, 'obj instanceof Type v &&' should.
-                    # The grammar for expression_3 or primary handles this.
-                    # If what follows comparison_type is not an expression_3 starting with an identifier
-                    # that could be a standalone variable, then it's not a pattern.
-                    # For now, we assume if an Identifier is next, it's a pattern var.
-                    # This might need refinement based on how parse_expression_3 consumes tokens.
+                # After 'instanceof', we expect a Type, which could be start of a pattern.
+                self.tokens.push_marker()
+                try:
+                    instanceof_type = self.parse_type() # This is the type in 'instanceof Type ...'
 
-                    # Try to parse it as an identifier, but allow fallback
-                    self.tokens.push_marker()
-                    try:
-                        # This is a bit tricky. We want to consume the identifier if it's
-                        # standalone, but not if it's the start of a more complex expression
-                        # that `parse_expression_3` should handle.
-                        # The structure of `build_binary_operation` expects the `operandr`
-                        # to be parsed by `parse_expression_3` IF this is not a pattern.
-                        # If it IS a pattern, the `comparison_type` IS the `operandr` conceptually for the `parts` list.
+                    # Check for Record Pattern: Type(...)
+                    if self.would_accept('('):
+                        components = self.parse_record_pattern_components(instanceof_type)
+                        record_pattern = tree.RecordPattern(type=instanceof_type, components=components)
+                        parts.extend((('instanceof_pattern', record_pattern), None))
+                        self.tokens.pop_marker(accept=True)
+                    # Check for Type Pattern: Type identifier
+                    elif isinstance(self.tokens.look(0), Identifier) and \
+                         not self.tokens.look(1).value in ['.', '(', '[']:
+                        pattern_name = self.parse_identifier()
+                        type_pattern_as_param = tree.FormalParameter(type=instanceof_type, name=pattern_name, modifiers=set(), annotations=[])
+                        parts.extend((('instanceof_pattern', type_pattern_as_param), None))
+                        self.tokens.pop_marker(accept=True)
+                    else: # Legacy instanceof Type
+                        self.tokens.pop_marker(accept=False) # Rollback type, then re-parse as part of expression_3 if needed, or just use it
+                        # This path means it's 'instanceof Type' where Type is the operandr.
+                        # The comparison_type here IS the operandr for build_binary_operation.
+                        parts.extend((('instanceof_type', instanceof_type), None)) # operandr is None here, type is passed in tuple
+                                                                                # This needs build_binary_operation to handle it.
+                                                                                # Or, ensure operandr is instanceof_type.
+                                                                                # Let's try: parts.extend(('instanceof_type', instanceof_type))
+                                                                                # then build_binary_operation needs to handle the 'None' operandr.
 
-                        # If the token after comparison_type is an Identifier,
-                        # AND this identifier is the *entirety* of the next expression_3 (or primary part thereof),
-                        # then it's a pattern variable. This is hard to check without full parsing.
-
-                        # Simplified approach: If next is Identifier, and next-next is not '(', '[', '.',
-                        # it's likely a pattern variable.
-                        # This is still not perfect. The JLS grammar implies that the pattern variable
-                        # is parsed if the type is matched.
-
-                        # Let's assume for now that if an Identifier immediately follows the type,
-                        # it's a pattern variable. The ambiguity is low in practice here.
-                        if isinstance(self.tokens.look(0), Identifier) and \
-                           not self.tokens.look(1).value in ['.', '(', '[']: # Check it's not start of qualified name, method call, or array access
-                            pattern_variable_name_str = self.parse_identifier()
-                            placeholder = ('instanceof_pattern', comparison_type, pattern_variable_name_str)
-                            parts.extend((placeholder, None)) # Add placeholder and None for operandr
-                        else:
-                            # Not a pattern, or pattern variable is part of a more complex expression
-                            # that parse_expression_3 will handle as the operandr.
-                            parts.extend(('instanceof', comparison_type))
-
-                        self.tokens.pop_marker(accept=True) # Commit if successful
-                    except JavaSyntaxError:
-                        self.tokens.pop_marker(accept=False) # Rollback if not an identifier
-                        parts.extend(('instanceof', comparison_type))
-                else: # Not an identifier, so not a pattern variable
-                    parts.extend(('instanceof', comparison_type))
-            else:
+                except JavaSyntaxError: # Failed to parse Type after instanceof
+                    self.tokens.pop_marker(accept=False)
+                    self.illegal("Type expected after 'instanceof'")
+            else: # Not 'instanceof', regular infix operator
                 operator = self.parse_infix_operator()
                 expression = self.parse_expression_3()
                 parts.extend((operator, expression))
@@ -2176,18 +2390,49 @@ class Parser(object):
 
         primary = self.parse_primary()
         primary.prefix_operators = prefix_operators
-        if getattr(primary, "selectors", None) is None:
+        # Ensure selectors and postfix_operators are initialized for the primary node
+        if not hasattr(primary, 'selectors') or primary.selectors is None:
             primary.selectors = list()
-        primary.postfix_operators = list()
+        if not hasattr(primary, 'postfix_operators') or primary.postfix_operators is None:
+            primary.postfix_operators = list()
 
-        token = self.tokens.look()
-        while token.value in '[.':
-            selector = self.parse_selector()
-            selector._position = token.position
-            primary.selectors.append(selector)
-
+        # Loop for selectors (member access, array index, method invocation) OR String Templates
+        while True:
             token = self.tokens.look()
 
+            if token.value == '.':
+                # Potential member access or string template
+                if isinstance(self.tokens.look(1), Literal):
+                    literal_peek = self.tokens.look(1)
+                    if literal_peek.value.startswith('"') or literal_peek.value.startswith('"""'):
+                        # This is a String Template
+                        self.accept('.') # Consume dot
+                        template_token = self.accept(Literal) # Consume string literal token
+                        primary = self._process_string_template_value(primary, template_token)
+                        break # String template terminates this expression chain part
+
+                # If not a string template, it's a standard selector starting with '.'
+                # Let parse_selector handle .identifier, .this, .super(), .new, etc.
+                selector = self.parse_selector() # parse_selector itself consumes the dot
+                primary.selectors.append(selector)
+
+            elif token.value == '[':
+                # Array selector
+                selector = self.parse_selector() # parse_selector consumes the '[' and ']'
+                primary.selectors.append(selector)
+
+            # NOTE: Method invocations like primary(...) are handled by parse_identifier_suffix
+            # when primary itself is just an identifier, or by parse_selector if primary is already complex.
+            # String templates like processor."..." are now handled above.
+
+            else: # Not a selector that starts with . or [ that this loop handles
+                break
+
+            token = self.tokens.look() # Update for next iteration
+
+        # Postfix operators like ++, --
+        # This loop should be separate and after the selector/template loop
+        token = self.tokens.look() # Re-fetch token, as it might have changed if selector loop broke early
         while token.value in Operator.POSTFIX:
             primary.postfix_operators.append(self.tokens.next().value)
             token = self.tokens.look()
@@ -2595,6 +2840,154 @@ class Parser(object):
                 return inner_creator
 
         self.illegal("Expected selector")
+
+    def _unescape_java_string_literal_content(self, raw_content_with_quotes):
+        # This is a simplified unescaper. A full one would handle all octal/unicode.
+        # It assumes that the main tokenizer has already processed the string if it was a text block
+        # and removed incidental whitespace. For simple string literals, it just unescapes common sequences.
+
+        # For string templates, the JLS implies that the string/text block is first processed
+        # for its own Java escapes, and THEN the resulting string is processed for template \{...}.
+        # So, this function should turn the source form (e.g., "\"\\n\"") into its actual value (e.g., "\n").
+
+        # If the input is from a Text Block token that already processed complex escapes and indents:
+        if not (raw_content_with_quotes.startswith('"') or raw_content_with_quotes.startswith('"""')):
+             # If it's already processed content (e.g. from a text block token value directly)
+             # For now, this function expects the raw token value.
+             # This part needs to be harmonized with how tokenizer.py actually stores Literal values.
+             # Assuming for now, the Literal.value is the raw source including quotes.
+             pass
+
+        content = ""
+        if raw_content_with_quotes.startswith('"""') and raw_content_with_quotes.endswith('"""'):
+            content = raw_content_with_quotes[3:-3]
+            # For text blocks, JEP 378 specifies complex processing (normalization, indent, then escapes).
+            # This simplified function doesn't redo all of that. It assumes if it's a text block,
+            # those were done by the tokenizer when creating the token, and `content` is the result.
+            # This is a known simplification point. For string templates, the spec says the
+            # string literal or text block is interpreted as usual, THEN processed for \{}.
+            # So, the value we get from the token should be the *final* string value.
+        elif raw_content_with_quotes.startswith('"') and raw_content_with_quotes.endswith('"'):
+            content = raw_content_with_quotes[1:-1]
+        else:
+            # Not a valid string literal token value format this method expects
+            self.illegal(f"Invalid string literal format for unescaping: {raw_content_with_quotes}")
+            return ""
+
+        # Simplified unescaping for standard Java escapes.
+        # A full implementation would use a state machine or regex for all Java escapes.
+        # This does not handle octal or unicode escapes like \uXXXX.
+        # `javalang.tokenizer.JavaTokenizer.pre_tokenize` handles unicode escapes globally.
+        # `javalang.tokenizer.JavaTokenizer.read_string` handles octal and other escapes.
+        # We are re-doing a simplified version here, which is not ideal.
+        # Ideally, the token value itself would be the fully Java-unescaped string content.
+
+        # For the purpose of template processing, the key is that `\` before `{` is significant.
+        # Standard escapes like `\n`, `\t` should be characters in the string being processed by the template logic.
+
+        # This is a placeholder for robust unescaping.
+        # Let's assume for now that the string content received by the template parser
+        # has already had its standard Java escapes (like \n, \t, \\, \") processed.
+        # So, `template_string_content` in `_process_string_template_value` will have these resolved.
+        return content
+
+
+    def _process_string_template_value(self, processor_node, template_literal_token):
+        # raw_template_string_with_quotes is like "\"string \\{expr} fragment\""
+        raw_template_string_with_quotes = template_literal_token.value
+
+        # Step 1: Get the actual character content of the string/text block.
+        # The tokenizer (read_string/read_text_block) should have already processed
+        # standard Java escapes (e.g., \\ -> \, \n -> newline char).
+        # We need to strip the outer quotes.
+        string_content = ""
+        is_text_block = False
+        if raw_template_string_with_quotes.startswith('"""') and raw_template_string_with_quotes.endswith('"""'):
+            string_content = raw_template_string_with_quotes[3:-3]
+            is_text_block = True
+            # For text blocks, complex indent processing and escape processing (including \s)
+            # are done by read_text_block. The resulting string_content here is what we need.
+        elif raw_template_string_with_quotes.startswith('"') and raw_template_string_with_quotes.endswith('"'):
+            string_content = raw_template_string_with_quotes[1:-1]
+            # For simple string literals, we need to unescape standard Java escapes
+            # to correctly find template processor sequences.
+            # This is a temporary, simplified unescaper.
+            # A better approach would be to get the already-unescaped value from the tokenizer/literal token.
+            # For now, we'll assume `string_content` needs basic unescaping if it wasn't a text block.
+            # However, JEP 430 implies the content is ALREADY the string value.
+            # Let's trust that string_content from a Literal token is the actual value.
+            # The `javalang.tokenizer.String` takes `self.data[self.i:self.j]`
+            # The `tree.Literal` stores this raw value.
+            # So, `_unescape_java_string_literal_content` is needed.
+            string_content = self._unescape_java_string_literal_content(raw_template_string_with_quotes)
+
+        fragments = []
+        expressions = []
+        current_fragment_chars = []
+        i = 0
+        n = len(string_content)
+
+        while i < n:
+            if string_content[i] == '\\':
+                if i + 1 < n:
+                    if string_content[i+1] == '{': # Start of an embedded expression \{
+                        if current_fragment_chars:
+                            fragments.append(tree.Literal(value='"{}"'.format("".join(current_fragment_chars).replace('"', '\\"'))))
+                            current_fragment_chars = []
+
+                        i += 2 # Skip '\' and '{'
+                        expr_start_index = i
+                        brace_level = 1
+                        while i < n and brace_level > 0:
+                            if string_content[i] == '\\' and i + 1 < n : # Check for escaped braces within expression
+                                i += 2 # Skip escaped char
+                            elif string_content[i] == '{':
+                                brace_level += 1
+                                i += 1
+                            elif string_content[i] == '}':
+                                brace_level -= 1
+                                i += 1
+                            else:
+                                i += 1
+
+                        if brace_level != 0:
+                            self.illegal("Unmatched brace in string template embedded expression", at=template_literal_token)
+
+                        expression_string = string_content[expr_start_index : i-1]
+
+                        if not expression_string.strip():
+                             self.illegal("Empty embedded expression in string template", at=template_literal_token)
+
+                        from .tokenizer import tokenize as template_tokenize # Local import
+                        expr_tokens = list(template_tokenize(expression_string))
+                        if not expr_tokens:
+                             self.illegal(f"Cannot parse empty embedded expression: '{expression_string}'", at=template_literal_token)
+
+                        expr_parser = Parser(iter(expr_tokens))
+                        parsed_expression = expr_parser.parse_expression()
+                        expressions.append(parsed_expression)
+                        # i is already past the closing '}' of the expression
+                        continue
+                    else: # Standard Java escape like \\, \", \n etc. Treat as part of fragment.
+                        current_fragment_chars.append('\\')
+                        current_fragment_chars.append(string_content[i+1])
+                        i += 2
+                        continue
+                else: # Trailing backslash
+                    current_fragment_chars.append('\\')
+                    i += 1
+                    continue
+            else: # Not a backslash
+                current_fragment_chars.append(string_content[i])
+                i += 1
+
+        if current_fragment_chars:
+            fragments.append(tree.Literal(value='"{}"'.format("".join(current_fragment_chars).replace('"', '\\"'))))
+
+        return tree.StringTemplate(processor=processor_node,
+                                   fragments=fragments,
+                                   expressions=expressions,
+                                   _position=processor_node.position if processor_node else template_literal_token.position)
 
 # ------------------------------------------------------------------------------
 # -- Enum and annotation body --
