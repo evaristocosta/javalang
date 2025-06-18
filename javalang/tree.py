@@ -34,10 +34,13 @@ class PackageDeclaration(Declaration, Documented):
     attrs = ("name",)
 
 class ClassDeclaration(TypeDeclaration):
-    attrs = ("type_parameters", "extends", "implements")
+    attrs = ("type_parameters", "extends", "implements", "permits")
 
 class EnumDeclaration(TypeDeclaration):
     attrs = ("implements",)
+
+class RecordDeclaration(TypeDeclaration):
+    attrs = ("type_parameters", "components", "implements", "body")
 
     @property
     def fields(self):
@@ -48,7 +51,7 @@ class EnumDeclaration(TypeDeclaration):
         return [decl for decl in self.body.declarations if isinstance(decl, MethodDeclaration)]
 
 class InterfaceDeclaration(TypeDeclaration):
-    attrs = ("type_parameters", "extends",)
+    attrs = ("type_parameters", "extends", "permits")
 
 class AnnotationDeclaration(TypeDeclaration):
     attrs = ()
@@ -167,6 +170,9 @@ class BlockStatement(Statement):
 class StatementExpression(Statement):
     attrs = ("expression",)
 
+class YieldStatement(Statement):
+    attrs = ("expression",)
+
 # ------------------------------------------------------------------------------
 
 class TryResource(Declaration):
@@ -181,13 +187,16 @@ class CatchClauseParameter(Declaration):
 # ------------------------------------------------------------------------------
 
 class SwitchStatementCase(Node):
-    attrs = ("case", "statements")
+    attrs = ("case", "guard", "statements")
 
 class ForControl(Node):
     attrs = ("init", "condition", "update")
 
 class EnhancedForControl(Node):
     attrs = ("var", "iterable")
+
+class SwitchRule(Node): # For Switch Expressions
+    attrs = ("labels", "guard", "action")
 
 # ------------------------------------------------------------------------------
 
@@ -211,6 +220,12 @@ class MethodReference(Expression):
 
 class LambdaExpression(Expression):
     attrs = ('parameters', 'body')
+
+class SwitchExpression(Expression):
+    attrs = ("selector", "cases")
+
+class InstanceOfPatternExpression(Expression):
+    attrs = ("expression", "type", "pattern_variable")
 
 # ------------------------------------------------------------------------------
 

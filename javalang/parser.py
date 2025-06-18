@@ -96,6 +96,7 @@ class Parser(object):
         self.tokens.set_default(EndOfInput(None))
 
         self.debug = False
+        self.parsing_switch_expression_block = False
 
 # ------------------------------------------------------------------------------
 # ---- Debug control ----
@@ -197,10 +198,25 @@ class Parser(object):
         operation = operands[0]
 
         for operator, operandr in zip(operators, operands[1:]):
-            operation = tree.BinaryOperation(operandl=operation)
-            operation.operator = operator
-            operation.operandr = operandr
-
+            if isinstance(operator, tuple) and operator[0] == 'instanceof_pattern':
+                _, type_node, var_name_str = operator
+                # 'operation' is the operandl (left-hand side of instanceof)
+                # 'operandr' (the type_node) is already captured in our tuple,
+                # but build_binary_operation structure provides it. We use the one from tuple.
+                pattern_var = tree.FormalParameter(type=type_node,
+                                                   name=var_name_str,
+                                                   modifiers=set(), # Pattern variables in instanceof don't have modifiers
+                                                   annotations=[]) # or annotations
+                operation = tree.InstanceOfPatternExpression(expression=operation,
+                                                             type=type_node,
+                                                             pattern_variable=pattern_var)
+            elif operator == 'instanceof': # Legacy instanceof
+                operation = tree.BinaryOperation(operandl=operation, operator='instanceof', operandr=operandr)
+            else: # Other binary operations
+                op_obj = tree.BinaryOperation(operandl=operation)
+                op_obj.operator = operator
+                op_obj.operandr = operandr
+                operation = op_obj
         return operation
 
     def is_annotation(self, i=0):
@@ -360,6 +376,8 @@ class Parser(object):
             type_declaration = self.parse_normal_interface_declaration()
         elif self.is_annotation_declaration():
             type_declaration = self.parse_annotation_type_declaration()
+        elif token.value == 'record': # Java 14 Record
+            type_declaration = self.parse_record_declaration()
         else:
             self.illegal("Expected type declaration")
 
@@ -391,12 +409,17 @@ class Parser(object):
         if self.try_accept('implements'):
             implements = self.parse_type_list()
 
+        permits_types = None
+        if self.try_accept('permits'):
+            permits_types = self.parse_type_list()
+
         body = self.parse_class_body()
 
         return tree.ClassDeclaration(name=name,
                                      type_parameters=type_params,
                                      extends=extends,
                                      implements=implements,
+                                     permits=permits_types,
                                      body=body)
 
     @parse_debug
@@ -433,11 +456,16 @@ class Parser(object):
         if self.try_accept('extends'):
             extends = self.parse_type_list()
 
+        permits_types = None
+        if self.try_accept('permits'):
+            permits_types = self.parse_type_list()
+
         body = self.parse_interface_body()
 
         return tree.InterfaceDeclaration(name=name,
                                          type_parameters=type_parameters,
                                          extends=extends,
+                                         permits=permits_types,
                                          body=body)
 
     @parse_debug
@@ -452,6 +480,69 @@ class Parser(object):
 
         return tree.AnnotationDeclaration(name=name,
                                           body=body)
+
+    @parse_debug
+    def parse_record_components(self):
+        self.accept('(')
+        components = []
+        if self.try_accept(')'):
+            return components
+
+        while True:
+            modifiers, annotations = self.parse_variable_modifiers()
+
+            token_pos_ref = self.tokens.look()
+            component_type = self.parse_type()
+
+            # Record components cannot be varargs
+            if self.would_accept('...'):
+                 self.illegal("Record components cannot be varargs", at=self.tokens.look())
+
+            component_name = self.parse_identifier()
+
+            # Dimensions for component type (e.g. int[] x) are part of the type itself
+            # If additional dimensions are after name, it's an error for record component syntax
+            # component_type.dimensions += self.parse_array_dimension() # This would be if name [] was allowed
+
+            parameter = tree.FormalParameter(modifiers=modifiers,
+                                             annotations=annotations,
+                                             type=component_type,
+                                             name=component_name,
+                                             varargs=False)
+            parameter._position = token_pos_ref.position
+            components.append(parameter)
+
+            if not self.try_accept(','):
+                break
+        self.accept(')')
+        return components
+
+    @parse_debug
+    def parse_record_declaration(self):
+        self.accept('record')
+        name = self.parse_identifier()
+
+        type_params = None
+        if self.would_accept('<'):
+            type_params = self.parse_type_parameters()
+
+        components = self.parse_record_components()
+
+        implements = None
+        if self.try_accept('implements'):
+            implements = self.parse_type_list()
+
+        body = None
+        if self.would_accept('{'):
+           body = self.parse_class_body()
+        else:
+           body = []
+
+        return tree.RecordDeclaration(name=name,
+                                     type_parameters=type_params,
+                                     components=components,
+                                     implements=implements,
+                                     body=body)
 
 # ------------------------------------------------------------------------------
 # -- Types --
@@ -1351,15 +1442,30 @@ class Parser(object):
     @parse_debug
     def parse_local_variable_declaration_statement(self):
         modifiers, annotations = self.parse_variable_modifiers()
-        java_type = self.parse_type()
+
+        java_type = None
+        # Check for 'var'
+        if self.tokens.look().value == 'var':
+            var_token = next(self.tokens) # Consume 'var'
+            java_type = tree.ReferenceType(name='var', dimensions=[])
+            # Note: 'var' cannot have array dimensions directly like 'var[]'
+            # but the variable it declares can be an array, handled by declarators.
+            # Ensure var_token.position is used if needed for AST node position.
+        else:
+            java_type = self.parse_type()
+
         declarators = self.parse_variable_declarators()
         self.accept(';')
 
-        var = tree.LocalVariableDeclaration(modifiers=modifiers,
-                                            annotations=annotations,
-                                            type=java_type,
-                                            declarators=declarators)
-        return var
+        var_decl_node = tree.LocalVariableDeclaration(
+            modifiers=modifiers,
+            annotations=annotations,
+            type=java_type,
+            declarators=declarators
+        )
+        # if var_token exists, you might want to set position from it
+        # var_decl_node._position = ...
+        return var_decl_node
 
     @parse_debug
     def parse_statement(self):
@@ -1545,6 +1651,123 @@ class Parser(object):
             statement._position = token.position
             return statement
 
+        # yield must be checked before attempting to parse a general expression statement
+        elif self.try_accept('yield') and self.parsing_switch_expression_block:
+            # This is context-sensitive: 'yield' is only a keyword here
+            # if self.parsing_switch_expression_block is True.
+            value = self.parse_expression()
+            self.accept(';')
+            statement = tree.YieldStatement(expression=value)
+            statement._position = token.position
+            return statement
+
+        else: # Default to expression statement
+            expression = self.parse_expression()
+            self.accept(';')
+
+            statement = tree.StatementExpression(expression=expression)
+            statement._position = token.position
+            return statement
+
+# ------------------------------------------------------------------------------
+# -- Switch Expression --
+
+    @parse_debug
+    def parse_switch_expression(self):
+        self.accept('switch')
+        selector = self.parse_par_expression() # switch (expression)
+        self.accept('{')
+        cases = []
+        while not self.would_accept('}'):
+            rule = self.parse_switch_rule()
+            cases.append(rule)
+        self.accept('}')
+        return tree.SwitchExpression(selector=selector, cases=cases)
+
+    @parse_debug
+    def parse_case_label(self):
+        """
+        Parses a case label, which can be:
+        - 'null'
+        - A type pattern (Type identifier)
+        - An expression (constant)
+        Returns an AST node representing the label (Literal for null, FormalParameter for type pattern, Expression for constants).
+        """
+        token_pos_ref = self.tokens.look()
+
+        if self.would_accept('null'):
+            # Check if 'null' is followed by an identifier, which would make it a type pattern 'null ident'.
+            # This is not standard for Java 17-21 'case null'. 'case null, default' is allowed.
+            # 'case null:' or 'case null ->'
+            # If 'null' is part of a pattern like 'NullType nullIdentifier', that's different.
+            # For 'case null:', 'null' acts like a special constant.
+            if not isinstance(self.tokens.look(1), Identifier): # Simple 'null' case label
+                self.accept('null')
+                return tree.Literal(value='null', _position=token_pos_ref.position)
+            # If 'null' is followed by an identifier, it might be 'null' as a type name (not standard)
+            # or an expression starting with 'null'. Let expression parser handle it.
+
+        # Try parsing as Type Pattern: Type identifier
+        self.tokens.push_marker()
+        try:
+            # Attempt to parse a type
+            parsed_type = self.parse_type()
+
+            # Check if next is an identifier (and not part of a more complex expression)
+            if isinstance(self.tokens.look(0), Identifier) and \
+               not self.tokens.look(1).value in ['.', '(', '[']: # Heuristic: not start of qualified name, method, array
+                pattern_variable_name = self.parse_identifier()
+                self.tokens.pop_marker(accept=True) # Commit
+                # Modifiers/annotations on pattern variables in case labels are not standard
+                return tree.FormalParameter(type=parsed_type,
+                                             name=pattern_variable_name,
+                                             modifiers=set(),
+                                             annotations=[],
+                                             varargs=False, # Patterns are not varargs
+                                             _position=token_pos_ref.position)
+            else: # Not a pattern of form "Type var"
+                self.tokens.pop_marker(accept=False) # Rollback
+        except JavaSyntaxError: # Failed to parse as Type or subsequent identifier
+            self.tokens.pop_marker(accept=False) # Rollback
+
+        # Fallback: Parse as an expression (constant expression or qualified enum constant)
+        return self.parse_expression()
+
+    @parse_debug
+    def parse_switch_rule(self): # For Switch Expressions
+        labels = []
+        guard = None
+
+        token = self.tokens.look()
+        if self.try_accept('default'):
+            labels.append(tree.Literal(value="'default'", _position=token.position)) # Represent default
+        elif self.try_accept('case'):
+            while True:
+                labels.append(self.parse_case_label())
+                if not self.try_accept(','):
+                    break
+        else:
+            self.illegal("Expected 'case' or 'default' in switch rule")
+
+        if self.try_accept('when'):
+            guard = self.parse_expression()
+
+        self.accept('->')
+
+        action = None
+        if self.would_accept('{'): # Block with potential yield
+            self.parsing_switch_expression_block = True
+            try:
+                action = self.parse_block()
+            finally:
+                self.parsing_switch_expression_block = False
+        else: # Single expression
+            action = self.parse_expression()
+            # Single expression form for switch expression rule does not end with a semicolon
+            # self.accept(';')
+
+        return tree.SwitchRule(labels=labels, guard=guard, action=action)
+
 # ------------------------------------------------------------------------------
 # -- Try / catch --
 
@@ -1629,34 +1852,57 @@ class Parser(object):
         return statement_groups
 
     @parse_debug
-    def parse_switch_block_statement_group(self):
-        labels = list()
+    def parse_switch_block_statement_group(self): # For Switch Statements
+        case_labels = [] # Renamed from 'labels' to avoid confusion with SwitchRule's labels
+        guard = None
         statements = list()
 
-        while True:
-            case_type = self.tokens.next().value
-            case_value = None
+        # This outer loop handles multiple 'case X:' clauses falling through
+        while self.tokens.look().value in ('case', 'default'):
+            current_label_token = self.tokens.look()
+            if self.try_accept('default'):
+                # Ensure only one default and it's the only label for this group if present
+                if any(isinstance(cl, tree.Literal) and cl.value == "'default'" for cl in case_labels):
+                    self.illegal("Multiple default labels or default with other case labels.")
+                case_labels.append(tree.Literal(value="'default'", _position=current_label_token.position))
+            elif self.try_accept('case'):
+                while True:
+                    case_labels.append(self.parse_case_label())
+                    if not self.try_accept(','):
+                        break
+            else:
+                # Should not happen due to outer loop condition, but as safeguard:
+                self.illegal("Expected 'case' or 'default'")
 
-            if case_type == 'case':
-                if self.would_accept(Identifier, ':'):
-                    case_value = self.parse_identifier()
-                else:
-                    case_value = self.parse_expression()
-
-                labels.append(case_value)
-            elif not case_type == 'default':
-                self.illegal("Expected switch case")
+            # Check for a guard clause for the current set of case labels
+            # A guard applies to all case patterns sharing that colon.
+            # Java grammar: CaseLabel: 'case' CasePattern (',' CasePattern)* | 'default'
+            # SwitchLabel: CaseLabel ( 'when' GuardedPattern )? ':'
+            # The current parsing structure might need adjustment if a single `when` can apply to `case A, B when G:`
+            # The current loop structure implies `case A when G1, B when G2:` which is not standard.
+            # A single 'when' clause applies to all labels before it.
+            # So, 'when' should be parsed *after* all comma-separated labels for a single 'case' line,
+            # but before the ':'.
+            # The current loop structure might be problematic for `case A, B when G:`. Let's assume `when` is parsed once.
+            if self.tokens.look().value == 'when': # Check before colon
+                if guard is not None:
+                    self.illegal("Multiple 'when' clauses for a single switch label group.")
+                self.accept('when')
+                guard = self.parse_expression()
 
             self.accept(':')
 
+            # If the next token is still 'case' or 'default', these labels fall through to the same block.
+            # The guard, if present, applies to all labels that fall into this block.
             if self.tokens.look().value not in ('case', 'default'):
-                break
+                break # End of label declarations for this group
 
+        # Parse statements for this group
         while self.tokens.look().value not in ('case', 'default', '}'):
             statement = self.parse_block_statement()
             statements.append(statement)
 
-        return tree.SwitchStatementCase(case=labels, statements=statements)
+        return tree.SwitchStatementCase(case=case_labels, guard=guard, statements=statements)
 
     @parse_debug
     def parse_for_control(self):
@@ -1691,9 +1937,17 @@ class Parser(object):
     @parse_debug
     def parse_for_var_control(self):
         modifiers, annotations = self.parse_variable_modifiers()
-        var_type = self.parse_type()
+
+        if self.tokens.look().value == 'var':
+            next(self.tokens) # Consume 'var'
+            var_type = tree.ReferenceType(name='var', dimensions=[])
+        else:
+            var_type = self.parse_type()
+
         var_name = self.parse_identifier()
-        var_type.dimensions += self.parse_array_dimension()
+        # For 'var', dimensions are handled by declarator, not directly on type
+        if var_type.name != 'var':
+            var_type.dimensions += self.parse_array_dimension()
 
         var = tree.VariableDeclaration(modifiers=modifiers,
                                        annotations=annotations,
@@ -1828,7 +2082,60 @@ class Parser(object):
         while token.value in Operator.INFIX or token.value == 'instanceof':
             if self.try_accept('instanceof'):
                 comparison_type = self.parse_type()
-                parts.extend(('instanceof', comparison_type))
+                # Check for pattern variable
+                pattern_variable_name_str = None
+                # Lookahead: next token is an Identifier, and not followed by '(', '.', etc.
+                # that would make it something else. For simplicity, just check if it's an Identifier.
+                # A more robust check might be needed for edge cases, e.g. if an identifier
+                # could be a type name in some context here.
+                if isinstance(self.tokens.look(), Identifier):
+                    # Check that this identifier isn't part of a qualified name or method call
+                    # This is a simplified check. A full check would involve more lookahead.
+                    # e.g. 'obj instanceof Type v.method()' should not parse 'v' as pattern.
+                    # However, 'obj instanceof Type v &&' should.
+                    # The grammar for expression_3 or primary handles this.
+                    # If what follows comparison_type is not an expression_3 starting with an identifier
+                    # that could be a standalone variable, then it's not a pattern.
+                    # For now, we assume if an Identifier is next, it's a pattern var.
+                    # This might need refinement based on how parse_expression_3 consumes tokens.
+
+                    # Try to parse it as an identifier, but allow fallback
+                    self.tokens.push_marker()
+                    try:
+                        # This is a bit tricky. We want to consume the identifier if it's
+                        # standalone, but not if it's the start of a more complex expression
+                        # that `parse_expression_3` should handle.
+                        # The structure of `build_binary_operation` expects the `operandr`
+                        # to be parsed by `parse_expression_3` IF this is not a pattern.
+                        # If it IS a pattern, the `comparison_type` IS the `operandr` conceptually for the `parts` list.
+
+                        # If the token after comparison_type is an Identifier,
+                        # AND this identifier is the *entirety* of the next expression_3 (or primary part thereof),
+                        # then it's a pattern variable. This is hard to check without full parsing.
+
+                        # Simplified approach: If next is Identifier, and next-next is not '(', '[', '.',
+                        # it's likely a pattern variable.
+                        # This is still not perfect. The JLS grammar implies that the pattern variable
+                        # is parsed if the type is matched.
+
+                        # Let's assume for now that if an Identifier immediately follows the type,
+                        # it's a pattern variable. The ambiguity is low in practice here.
+                        if isinstance(self.tokens.look(0), Identifier) and \
+                           not self.tokens.look(1).value in ['.', '(', '[']: # Check it's not start of qualified name, method call, or array access
+                            pattern_variable_name_str = self.parse_identifier()
+                            placeholder = ('instanceof_pattern', comparison_type, pattern_variable_name_str)
+                            parts.extend((placeholder, None)) # Add placeholder and None for operandr
+                        else:
+                            # Not a pattern, or pattern variable is part of a more complex expression
+                            # that parse_expression_3 will handle as the operandr.
+                            parts.extend(('instanceof', comparison_type))
+
+                        self.tokens.pop_marker(accept=True) # Commit if successful
+                    except JavaSyntaxError:
+                        self.tokens.pop_marker(accept=False) # Rollback if not an identifier
+                        parts.extend(('instanceof', comparison_type))
+                else: # Not an identifier, so not a pattern variable
+                    parts.extend(('instanceof', comparison_type))
             else:
                 operator = self.parse_infix_operator()
                 expression = self.parse_expression_3()
@@ -2018,6 +2325,9 @@ class Parser(object):
         elif self.try_accept('void'):
             self.accept('.', 'class')
             return tree.VoidClassReference()
+
+        elif token.value == 'switch':
+           return self.parse_switch_expression()
 
         self.illegal("Expected expression")
 
