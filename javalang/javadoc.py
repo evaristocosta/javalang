@@ -45,6 +45,15 @@ class DocBlock(object):
         elif name == 'deprecated':
             self.deprecated = True
 
+        # Explicitly recognize snippet, though default handling is the same.
+        # For inline snippets like {@snippet ...}, this parser would need significant
+        # enhancements as it currently only processes block tags.
+        # The existing mechanism will store the full content of an @snippet block tag.
+        elif name == 'snippet':
+            # The value already contains the full content of the block tag.
+            # The default setdefault below would handle this too.
+            pass # Fall through to default handling
+
         self.tags.setdefault(name, []).append(value)
 
 blocks_re = re.compile('(^@)', re.MULTILINE)

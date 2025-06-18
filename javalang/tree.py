@@ -4,7 +4,7 @@ from .ast import Node
 # ------------------------------------------------------------------------------
 
 class CompilationUnit(Node):
-    attrs = ("package", "imports", "types")
+    attrs = ("package", "imports", "declarations") # Renamed types to declarations
 
 class Import(Node):
     attrs = ("path", "static", "wildcard")
@@ -225,7 +225,13 @@ class SwitchExpression(Expression):
     attrs = ("selector", "cases")
 
 class InstanceOfPatternExpression(Expression):
-    attrs = ("expression", "type", "pattern_variable")
+    attrs = ("expression", "type", "pattern") # Renamed pattern_variable to pattern
+
+class RecordPattern(Node):
+    attrs = ("type", "components")
+
+class StringTemplate(Expression):
+    attrs = ("processor", "fragments", "expressions")
 
 # ------------------------------------------------------------------------------
 
