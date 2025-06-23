@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "javalang"
+version = "0.13.0"
+authors = [
+  {name = "Chris Thunes", email = "cthunes@brewtab.com"}
+]
+description = "Pure Python Java parser and tools"
+readme = "README.rst"
+requires-python = ">=3.6" # Assuming a reasonable modern Python version
+license = "MIT"
+license-files = ["LICENSE.txt"]
+keywords = ["java", "parser", "lexer"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "six",
+]
+
+[project.urls]
+Homepage = "http://github.com/c2nes/javalang"
+Repository = "http://github.com/c2nes/javalang"
+
+[project.optional-dependencies]
+test = [
+    "nose",
+]
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = true # This should help include files specified by MANIFEST.in or package_data
+
+[tool.setuptools.packages.find]
+where = ["."] # Search for packages in the current directory
+include = ["javalang*"] # Include javalang and its subpackages
+exclude = ["javalang.test*"] # Exclude test packages from the main distribution
+
+[tool.setuptools.package-data]
+javalang = ["py.typed"] # Example if you wanted to include type hints, can be removed if not needed
+# If there were other data files within the javalang package, they'd be listed here.
+# For now, README.rst is handled by `project.readme` and `include-package-data = true`
+# should ensure MANIFEST.in inclusions are respected if it's kept.
+
+# Regarding test_suite = "nose.collector" from setup.py:
+# This is typically handled by invoking the test runner directly, e.g., `python -m nose`.
+# If you want to define a command for tests, you might use a tool like `tox` or a script,
+# or define a custom setuptools command if really needed, but it's less common with pyproject.toml.
+# For now, I'm assuming tests will be run via `nose` directly.
